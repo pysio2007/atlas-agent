@@ -34,9 +34,9 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
-func (s *Store) GetProbeID() string {
+func (s *Store) GetProbeID() (string, error) {
 	var id string
-	s.db.View(func(tx *bolt.Tx) error {
+	err := s.db.View(func(tx *bolt.Tx) error {
 		b := tx.Bucket([]byte("state"))
 		if b == nil {
 			return nil
@@ -49,7 +49,11 @@ func (s *Store) GetProbeID() string {
 		}
 		return nil
 	})
-	return id
+	if err != nil {
+		s.log.WithError(err).Warn("failed to read probe_id")
+		return "", err
+	}
+	return id, nil
 }
 
 func (s *Store) SetProbeID(id string) error {

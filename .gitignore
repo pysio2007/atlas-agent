@@ -1,3 +1,4 @@
 atlas-agent
 *.exe
 *.db
+autopeer-agent

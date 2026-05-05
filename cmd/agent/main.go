@@ -7,6 +7,8 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"runtime"
+	"strings"
 	"syscall"
 	"time"
 
@@ -41,7 +43,14 @@ func main() {
 		"traceroute": &runner.TracerouteRunner{},
 		"dns":        &runner.DNSRunner{},
 		"http":       &runner.HTTPRunner{},
+		"tls":        &runner.TLSRunner{},
+		"ntp":        &runner.NTPRunner{},
 	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	capabilityReport := runner.DetectCapabilities(ctx)
+	cancel()
+	clockStatus := checkClockStatus(log)
 
 	ipv4Reachable := checkPing(log, "172.20.0.53")
 	dn42DNSWorks := checkDN42DNSResolve(log, "wiki.dn42")
@@ -51,6 +60,12 @@ func main() {
 		"dn42_ipv4_reachable": ipv4Reachable,
 		"dn42_dns_works":      dn42DNSWorks,
 		"system_dns_works":    systemDNSWorks,
+		"capabilities":        capabilityReport.Capabilities,
+		"capability_versions": capabilityReport.Versions,
+		"platform":            runtime.GOOS + "/" + runtime.GOARCH,
+		"os":                  runtime.GOOS,
+		"arch":                runtime.GOARCH,
+		"clock_status":        clockStatus,
 	}).Info("connectivity check complete")
 
 	var client *ws.Client
@@ -58,11 +73,15 @@ func main() {
 	h := handler.New(runners, s, func(msg map[string]any) {
 		client.Send(msg)
 	}, log)
+	h.SetClockStatus(clockStatus)
 
 	client = ws.NewClient(cfg, s, h, log)
+	client.SetCapabilities(capabilityReport.Capabilities, capabilityReport.Versions)
+	h.SetAuthFailedFunc(client.Close)
+	client.SetStatusProvider(h)
 	client.SetConnectivity(ipv4Reachable, dn42DNSWorks, systemDNSWorks)
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel = context.WithCancel(context.Background())
 	defer cancel()
 
 	sigCh := make(chan os.Signal, 1)
@@ -120,4 +139,26 @@ func checkSystemDNSResolve(log *logrus.Logger, domain string) bool {
 		return false
 	}
 	return true
+}
+
+func checkClockStatus(log *logrus.Logger) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "timedatectl", "show", "-p", "NTPSynchronized", "--value")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		log.WithError(err).Debug("clock status check failed")
+		return "unknown"
+	}
+	status := strings.TrimSpace(string(out))
+	switch strings.ToLower(status) {
+	case "yes":
+		return "synchronized"
+	case "no":
+		return "unsynchronized"
+	case "":
+		return "unknown"
+	default:
+		return status
+	}
 }
