@@ -3,9 +3,12 @@ package main
 import (
 	"context"
 	"flag"
+	"net"
 	"os"
+	"os/exec"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/akaere/autopeer/atlas-agent/internal/config"
 	"github.com/akaere/autopeer/atlas-agent/internal/handler"
@@ -40,6 +43,16 @@ func main() {
 		"http":       &runner.HTTPRunner{},
 	}
 
+	ipv4Reachable := checkPing(log, "172.20.0.53")
+	dn42DNSWorks := checkDN42DNSResolve(log, "wiki.dn42")
+	systemDNSWorks := checkSystemDNSResolve(log, "wiki.dn42")
+
+	log.WithFields(logrus.Fields{
+		"dn42_ipv4_reachable": ipv4Reachable,
+		"dn42_dns_works":      dn42DNSWorks,
+		"system_dns_works":    systemDNSWorks,
+	}).Info("connectivity check complete")
+
 	var client *ws.Client
 
 	h := handler.New(runners, s, func(msg map[string]any) {
@@ -47,6 +60,7 @@ func main() {
 	}, log)
 
 	client = ws.NewClient(cfg, s, h, log)
+	client.SetConnectivity(ipv4Reachable, dn42DNSWorks, systemDNSWorks)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -65,4 +79,45 @@ func main() {
 	}
 
 	log.Info("shutdown complete")
+}
+
+func checkPing(log *logrus.Logger, target string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "ping", "-c", "1", "-W", "3", target)
+	_, err := cmd.CombinedOutput()
+	if err != nil {
+		log.WithError(err).WithField("target", target).Debug("ping check failed")
+		return false
+	}
+	return true
+}
+
+func checkDN42DNSResolve(log *logrus.Logger, domain string) bool {
+	r := &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			d := net.Dialer{Timeout: 5 * time.Second}
+			return d.DialContext(ctx, "udp", "172.20.0.53:53")
+		},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := r.LookupHost(ctx, domain)
+	if err != nil {
+		log.WithError(err).WithField("domain", domain).Debug("DN42 DNS resolve failed")
+		return false
+	}
+	return true
+}
+
+func checkSystemDNSResolve(log *logrus.Logger, domain string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := net.DefaultResolver.LookupHost(ctx, domain)
+	if err != nil {
+		log.WithError(err).WithField("domain", domain).Debug("system DNS resolve failed")
+		return false
+	}
+	return true
 }

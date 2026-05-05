@@ -35,8 +35,11 @@ type Client struct {
 	connMu sync.Mutex
 	sendCh chan map[string]any
 
-	dn42IPv4 string
-	dn42IPv6 string
+	dn42IPv4Reachable bool
+	dn42DNSWorks      bool
+	systemDNSWorks    bool
+	dn42IPv4          string
+	dn42IPv6          string
 }
 
 func NewClient(cfg *config.Config, s Store, h MessageHandler, log *logrus.Logger) *Client {
@@ -47,6 +50,12 @@ func NewClient(cfg *config.Config, s Store, h MessageHandler, log *logrus.Logger
 		log:     log,
 		sendCh:  make(chan map[string]any, 256),
 	}
+}
+
+func (c *Client) SetConnectivity(ipv4Reachable, dn42DNS, systemDNS bool) {
+	c.dn42IPv4Reachable = ipv4Reachable
+	c.dn42DNSWorks = dn42DNS
+	c.systemDNSWorks = systemDNS
 }
 
 func (c *Client) Run(ctx context.Context) error {
@@ -104,12 +113,15 @@ func (c *Client) sendAuth(conn *websocket.Conn) error {
 	publicIP := c.detectPublicIP()
 
 	payload := map[string]any{
-		"token":     c.cfg.Token,
-		"version":   "1.0.0",
-		"dn42_ipv4": dn42IPv4,
-		"dn42_ipv6": dn42IPv6,
-		"public_ip": publicIP,
-		"probe_id":  c.store.GetProbeID(),
+		"token":                c.cfg.Token,
+		"version":              "1.0.0",
+		"dn42_ipv4":            dn42IPv4,
+		"dn42_ipv6":            dn42IPv6,
+		"public_ip":            publicIP,
+		"probe_id":             c.store.GetProbeID(),
+		"dn42_ipv4_reachable":  c.dn42IPv4Reachable,
+		"dn42_dns_works":       c.dn42DNSWorks,
+		"system_dns_works":     c.systemDNSWorks,
 	}
 
 	msg := map[string]any{
