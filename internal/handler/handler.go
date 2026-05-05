@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/akaere/autopeer/atlas-agent/internal/runner"
 	"github.com/akaere/autopeer/atlas-agent/internal/store"
@@ -43,7 +44,18 @@ func (h *Handler) HandleMessage(msg map[string]any) {
 }
 
 func (h *Handler) handleAuthAck(msg map[string]any) {
-	probeID, _ := msg["probe_id"].(string)
+	payload, _ := msg["payload"].(map[string]any)
+	if payload == nil {
+		h.log.Warn("auth_ack missing payload")
+		return
+	}
+	success, _ := payload["success"].(bool)
+	if !success {
+		errStr, _ := payload["error"].(string)
+		h.log.WithField("error", errStr).Error("atlas auth rejected")
+		return
+	}
+	probeID, _ := payload["probe_id"].(string)
 	if probeID == "" {
 		h.log.Warn("auth_ack missing probe_id")
 		return
@@ -56,33 +68,53 @@ func (h *Handler) handleAuthAck(msg map[string]any) {
 }
 
 func (h *Handler) handleJob(msg map[string]any) {
-	jobID, _ := msg["job_id"].(string)
-	jobType, _ := msg["job_type"].(string)
-	target, _ := msg["target"].(string)
-	options := msg["options"]
+	resultID, _ := msg["id"].(string)
+	payload, _ := msg["payload"].(map[string]any)
+	if payload == nil {
+		h.log.Warn("job missing payload")
+		return
+	}
+	jobType, _ := payload["type"].(string)
+	target, _ := payload["target"].(string)
+	options := payload["options"]
 
 	r, ok := h.runners[jobType]
 	if !ok {
-		h.sendResult(jobID, jobType, target, nil, fmt.Errorf("unknown job type: %s", jobType))
+		h.sendResult(resultID, nil, fmt.Errorf("unknown job type: %s", jobType))
 		return
 	}
 
+	startedAt := time.Now()
 	result, err := r.Run(context.Background(), target, options)
-	h.sendResult(jobID, jobType, target, result, err)
+	completedAt := time.Now()
+	h.sendResult(resultID, result, err, startedAt, completedAt)
 }
 
-func (h *Handler) sendResult(jobID, jobType, target string, result any, err error) {
-	msg := map[string]any{
-		"type":     "atlas.result",
-		"job_id":   jobID,
-		"job_type": jobType,
-		"target":   target,
+func (h *Handler) sendResult(resultID string, result any, err error, startedAt ...time.Time) {
+	started := time.Time{}
+	completed := time.Now()
+	if len(startedAt) > 0 {
+		started = startedAt[0]
+		completed = time.Now()
+	}
+
+	payload := map[string]any{
+		"result_id":    resultID,
+		"success":      err == nil,
+		"started_at":   started.Format(time.RFC3339),
+		"completed_at": completed.Format(time.RFC3339),
 	}
 
 	if err != nil {
-		msg["error"] = err.Error()
+		payload["error"] = err.Error()
 	} else {
-		msg["result"] = result
+		payload["result"] = result
+	}
+
+	msg := map[string]any{
+		"type":    "atlas.result",
+		"id":      resultID,
+		"payload": payload,
 	}
 
 	h.send(msg)

@@ -34,6 +34,9 @@ type Client struct {
 	conn   *websocket.Conn
 	connMu sync.Mutex
 	sendCh chan map[string]any
+
+	dn42IPv4 string
+	dn42IPv6 string
 }
 
 func NewClient(cfg *config.Config, s Store, h MessageHandler, log *logrus.Logger) *Client {
@@ -96,19 +99,22 @@ func (c *Client) connectAndServe(ctx context.Context) error {
 
 func (c *Client) sendAuth(conn *websocket.Conn) error {
 	dn42IPv4, dn42IPv6 := c.detectDN42IPs()
+	c.dn42IPv4 = dn42IPv4
+	c.dn42IPv6 = dn42IPv6
 	publicIP := c.detectPublicIP()
 
-	msg := map[string]any{
-		"type":      "atlas.auth",
+	payload := map[string]any{
 		"token":     c.cfg.Token,
 		"version":   "1.0.0",
 		"dn42_ipv4": dn42IPv4,
 		"dn42_ipv6": dn42IPv6,
 		"public_ip": publicIP,
+		"probe_id":  c.store.GetProbeID(),
 	}
 
-	if probeID := c.store.GetProbeID(); probeID != "" {
-		msg["probe_id"] = probeID
+	msg := map[string]any{
+		"type":    "atlas.auth",
+		"payload": payload,
 	}
 
 	return c.writeJSON(conn, msg)
@@ -148,7 +154,16 @@ func (c *Client) heartbeatLoop(ctx context.Context, conn *websocket.Conn, errCh 
 	for {
 		select {
 		case <-ticker.C:
-			if err := c.writeJSON(conn, map[string]any{"type": "atlas.heartbeat"}); err != nil {
+			msg := map[string]any{
+				"type": "atlas.heartbeat",
+				"payload": map[string]any{
+					"probe_id":  c.store.GetProbeID(),
+					"version":   "1.0.0",
+					"dn42_ipv4": c.dn42IPv4,
+					"dn42_ipv6": c.dn42IPv6,
+				},
+			}
+			if err := c.writeJSON(conn, msg); err != nil {
 				errCh <- fmt.Errorf("heartbeat: %w", err)
 				return
 			}
