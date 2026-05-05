@@ -14,6 +14,7 @@ type PingRunner struct{}
 var (
 	rttLineRe   = regexp.MustCompile(`rtt min/avg/max/(?:mdev|stddev) = ([\d.]+)/([\d.]+)/([\d.]+)/([\d.]+) ms`)
 	statsLineRe = regexp.MustCompile(`(\d+) packets transmitted, (\d+) received, ([\d.]+)% packet loss`)
+	pingReplyRe = regexp.MustCompile(`(?:\d+ bytes from|from)\s+(.+?):.*icmp_seq=(\d+).*ttl=(\d+).*time=([\d.]+)`)
 )
 
 func (p *PingRunner) Run(ctx context.Context, target string, options any) (any, error) {
@@ -83,8 +84,23 @@ func (p *PingRunner) Run(ctx context.Context, target string, options any) (any, 
 	}
 
 	rtts := []float64{}
+	packets := []map[string]any{}
 	for _, line := range strings.Split(output, "\n") {
 		line = strings.TrimSpace(line)
+		if pm := pingReplyRe.FindStringSubmatch(line); len(pm) == 5 {
+			seq, _ := strconv.Atoi(pm[2])
+			ttl, _ := strconv.Atoi(pm[3])
+			rtt, _ := strconv.ParseFloat(pm[4], 64)
+			rtts = append(rtts, rtt)
+			packets = append(packets, map[string]any{
+				"seq":    seq,
+				"from":   strings.TrimSpace(pm[1]),
+				"ttl":    ttl,
+				"rtt":    rtt,
+				"rtt_ms": rtt,
+			})
+			continue
+		}
 		if strings.HasPrefix(line, "64 bytes from") || strings.Contains(line, "icmp_seq") {
 			parts := strings.Split(line, "time=")
 			if len(parts) < 2 {
@@ -99,6 +115,18 @@ func (p *PingRunner) Run(ctx context.Context, target string, options any) (any, 
 		}
 	}
 	result["rtts"] = rtts
+	result["result"] = packets
+	if _, ok := result["received"]; !ok {
+		result["received"] = len(packets)
+		result["rcvd"] = len(packets)
+	} else if received, ok := result["received"].(int); ok {
+		result["rcvd"] = received
+	}
+	result["dup"] = 0
+	if received, ok := result["received"].(int); ok && received == 0 {
+		result["measurement_status"] = "error"
+		result["error_type"] = "timeout"
+	}
 
 	return result, nil
 }

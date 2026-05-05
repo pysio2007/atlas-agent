@@ -18,6 +18,7 @@ func (d *DNSRunner) Run(ctx context.Context, target string, options any) (any, e
 	qtype := "A"
 	resolver := "172.20.0.53:53"
 	timeoutMs := 5000
+	proto := "udp"
 
 	if m, ok := options.(map[string]any); ok {
 		if v, ok := m["qname"].(string); ok && v != "" {
@@ -34,12 +35,18 @@ func (d *DNSRunner) Run(ctx context.Context, target string, options any) (any, e
 				timeoutMs = n
 			}
 		}
+		if v, ok := m["proto"].(string); ok && v != "" {
+			proto = strings.ToLower(v)
+		}
 	}
 	if strings.TrimSpace(qname) == "" {
 		return nil, fmt.Errorf("qname is required")
 	}
 	if timeoutMs < 500 || timeoutMs > 30000 {
 		return nil, fmt.Errorf("invalid dns timeout_ms %d: must be 500-30000", timeoutMs)
+	}
+	if proto != "udp" && proto != "tcp" {
+		return nil, fmt.Errorf("invalid dns proto %s: must be udp or tcp", proto)
 	}
 
 	qt, ok := dns.StringToType[strings.ToUpper(qtype)]
@@ -49,26 +56,35 @@ func (d *DNSRunner) Run(ctx context.Context, target string, options any) (any, e
 
 	msg := new(dns.Msg)
 	msg.SetQuestion(dns.Fqdn(qname), qt)
-	client := &dns.Client{Net: "udp", Timeout: time.Duration(timeoutMs) * time.Millisecond}
+	client := &dns.Client{Net: proto, Timeout: time.Duration(timeoutMs) * time.Millisecond}
 
 	start := time.Now()
 	reply, _, err := client.ExchangeContext(ctx, msg, resolver)
+	if err == nil && reply != nil && reply.Truncated && proto == "udp" {
+		client.Net = "tcp"
+		proto = "tcp"
+		reply, _, err = client.ExchangeContext(ctx, msg, resolver)
+	}
 	latencyMs := float64(time.Since(start).Microseconds()) / 1000
 	if err != nil {
 		errorType := dnsErrorType(err)
-		return dnsResult(qname, qtype, resolver, "", nil, latencyMs, errorType, err.Error()), nil
+		return dnsResult(qname, qtype, resolver, proto, "", 0, nil, nil, nil, nil, latencyMs, errorType, err.Error()), nil
+	}
+	if reply == nil {
+		return dnsResult(qname, qtype, resolver, proto, "", 0, nil, nil, nil, nil, latencyMs, "error", "empty dns reply"), nil
 	}
 
-	answers := make([]map[string]any, 0, len(reply.Answer))
-	for _, rr := range reply.Answer {
-		header := rr.Header()
-		answers = append(answers, map[string]any{
-			"name":  header.Name,
-			"type":  dns.TypeToString[header.Rrtype],
-			"ttl":   header.Ttl,
-			"rdata": strings.TrimPrefix(strings.TrimSpace(strings.TrimPrefix(rr.String(), header.String())), "\t"),
+	questions := make([]map[string]any, 0, len(reply.Question))
+	for _, q := range reply.Question {
+		questions = append(questions, map[string]any{
+			"name":  q.Name,
+			"type":  dns.TypeToString[q.Qtype],
+			"class": dns.ClassToString[q.Qclass],
 		})
 	}
+	answers := dnsSection(reply.Answer)
+	authority := dnsSection(reply.Ns)
+	additional := dnsSection(reply.Extra)
 
 	rcode := dns.RcodeToString[reply.Rcode]
 	errorType := ""
@@ -81,7 +97,16 @@ func (d *DNSRunner) Run(ctx context.Context, target string, options any) (any, e
 			errorType = "dns_rcode"
 		}
 	}
-	result := dnsResult(qname, qtype, resolver, rcode, answers, latencyMs, errorType, "")
+	flags := map[string]any{
+		"authoritative":       reply.Authoritative,
+		"truncated":           reply.Truncated,
+		"recursion_desired":   reply.RecursionDesired,
+		"recursion_available": reply.RecursionAvailable,
+		"authenticated_data":  reply.AuthenticatedData,
+		"checking_disabled":   reply.CheckingDisabled,
+	}
+	result := dnsResult(qname, qtype, resolver, proto, rcode, reply.Rcode, questions, answers, authority, additional, latencyMs, errorType, "")
+	result["flags"] = flags
 	result["measurement_status"] = status
 	return result, nil
 }
@@ -104,16 +129,45 @@ func dnsErrorType(err error) string {
 	return "error"
 }
 
-func dnsResult(qname, qtype, resolver, rcode string, answers []map[string]any, latencyMs float64, errorType, errMsg string) map[string]any {
+func dnsSection(records []dns.RR) []map[string]any {
+	items := make([]map[string]any, 0, len(records))
+	for _, rr := range records {
+		header := rr.Header()
+		items = append(items, map[string]any{
+			"name":  header.Name,
+			"type":  dns.TypeToString[header.Rrtype],
+			"ttl":   header.Ttl,
+			"class": dns.ClassToString[header.Class],
+			"rdata": strings.TrimPrefix(strings.TrimSpace(strings.TrimPrefix(rr.String(), header.String())), "\t"),
+		})
+	}
+	return items
+}
+
+func dnsResult(qname, qtype, resolver, proto, rcode string, rcodeValue int, questions, answers, authority, additional []map[string]any, latencyMs float64, errorType, errMsg string) map[string]any {
+	if questions == nil {
+		questions = []map[string]any{}
+	}
 	if answers == nil {
 		answers = []map[string]any{}
+	}
+	if authority == nil {
+		authority = []map[string]any{}
+	}
+	if additional == nil {
+		additional = []map[string]any{}
 	}
 	result := map[string]any{
 		"qname":              qname,
 		"qtype":              qtype,
 		"resolver":           resolver,
+		"protocol":           proto,
+		"questions":          questions,
 		"answers":            answers,
+		"authority":          authority,
+		"additional":         additional,
 		"rcode":              rcode,
+		"rcode_value":        rcodeValue,
 		"latency_ms":         latencyMs,
 		"error_type":         errorType,
 		"measurement_status": "ok",

@@ -2,7 +2,9 @@ package runner
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/hex"
 	"fmt"
 	"net"
 	"strconv"
@@ -58,6 +60,7 @@ func (t *TLSRunner) Run(ctx context.Context, target string, options any) (any, e
 		}
 		resolvedHost = addrs[0].IP.String()
 	}
+	result["server_name"] = serverName
 
 	connectStart := time.Now()
 	dialer := net.Dialer{Timeout: time.Duration(timeoutMs) * time.Millisecond}
@@ -67,6 +70,8 @@ func (t *TLSRunner) Run(ctx context.Context, target string, options any) (any, e
 	}
 	timings["connect_ms"] = millisSince(connectStart)
 	defer conn.Close()
+	result["src_addr"] = conn.LocalAddr().String()
+	result["dst_addr"] = conn.RemoteAddr().String()
 
 	tlsConn := tls.Client(conn, &tls.Config{ServerName: serverName})
 	if err := tlsConn.SetDeadline(time.Now().Add(time.Duration(timeoutMs) * time.Millisecond)); err != nil {
@@ -90,13 +95,41 @@ func (t *TLSRunner) Run(ctx context.Context, target string, options any) (any, e
 	result["handshake_ms"] = timings["tls_ms"]
 	result["version"] = tlsVersionName(state.Version)
 	result["cipher_suite"] = tls.CipherSuiteName(state.CipherSuite)
+	result["alpn"] = state.NegotiatedProtocol
+	result["verified"] = true
 	result["not_before"] = leaf.NotBefore.UTC().Format(time.RFC3339)
 	result["not_after"] = leaf.NotAfter.UTC().Format(time.RFC3339)
 	result["subject"] = leaf.Subject.String()
 	result["issuer"] = leaf.Issuer.String()
+	result["certificates"] = tlsCertificates(state)
 	result["measurement_status"] = "ok"
 
 	return result, nil
+}
+
+func tlsCertificates(state tls.ConnectionState) []map[string]any {
+	certificates := make([]map[string]any, 0, len(state.PeerCertificates))
+	for _, cert := range state.PeerCertificates {
+		if cert == nil {
+			continue
+		}
+		fingerprint := sha256.Sum256(cert.Raw)
+		ipAddresses := make([]string, 0, len(cert.IPAddresses))
+		for _, ip := range cert.IPAddresses {
+			ipAddresses = append(ipAddresses, ip.String())
+		}
+		certificates = append(certificates, map[string]any{
+			"subject":            cert.Subject.String(),
+			"issuer":             cert.Issuer.String(),
+			"serial_number":      cert.SerialNumber.String(),
+			"not_before":         cert.NotBefore.UTC().Format(time.RFC3339),
+			"not_after":          cert.NotAfter.UTC().Format(time.RFC3339),
+			"dns_names":          cert.DNSNames,
+			"ip_addresses":       ipAddresses,
+			"sha256_fingerprint": hex.EncodeToString(fingerprint[:]),
+		})
+	}
+	return certificates
 }
 
 func tlsVersionName(version uint16) string {

@@ -50,22 +50,38 @@ func (h *HTTPRunner) Run(ctx context.Context, target string, options any) (any, 
 
 	var bodyBytes int64
 	timings := map[string]float64{}
+	var srcAddr, dstAddr string
 	var dnsStart, connectStart, tlsStart, requestStart time.Time
+	dialer := &safeDialer{
+		dialer: net.Dialer{Timeout: time.Duration(timeoutMs) * time.Millisecond},
+	}
 	transport := &http.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: false},
-		DialContext: (&safeDialer{
-			dialer: net.Dialer{Timeout: time.Duration(timeoutMs) * time.Millisecond},
-		}).DialContext,
+		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+			conn, err := dialer.DialContext(ctx, network, address)
+			if err != nil {
+				return nil, err
+			}
+			srcAddr = conn.LocalAddr().String()
+			dstAddr = conn.RemoteAddr().String()
+			return conn, nil
+		},
 	}
 	client := &http.Client{
 		Timeout:   time.Duration(timeoutMs) * time.Millisecond,
 		Transport: transport,
 	}
 
-	if !followRedirects {
-		client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+	redirectCount := 0
+	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		redirectCount = len(via)
+		if len(via) >= 10 {
 			return http.ErrUseLastResponse
 		}
+		if !followRedirects {
+			return http.ErrUseLastResponse
+		}
+		return nil
 	}
 
 	req, err := http.NewRequestWithContext(ctx, method, target, nil)
@@ -106,11 +122,18 @@ func (h *HTTPRunner) Run(ctx context.Context, target string, options any) (any, 
 	if err != nil {
 		return map[string]any{
 			"url":                target,
+			"method":             method,
+			"scheme":             parsedURL.Scheme,
+			"proto":              "tcp",
 			"status_code":        0,
 			"http_status":        0,
 			"latency_ms":         elapsed,
+			"total_ms":           elapsed,
 			"body_bytes":         0,
 			"timings":            timings,
+			"src_addr":           srcAddr,
+			"dst_addr":           dstAddr,
+			"redirect_count":     redirectCount,
 			"error":              err.Error(),
 			"error_type":         httpErrorType(err),
 			"measurement_status": "error",
@@ -119,16 +142,28 @@ func (h *HTTPRunner) Run(ctx context.Context, target string, options any) (any, 
 	defer resp.Body.Close()
 
 	limited := io.LimitReader(resp.Body, 64*1024)
+	transferStart := time.Now()
 	n, _ := io.Copy(io.Discard, limited)
+	transferMs := millisSince(transferStart)
 	bodyBytes = n
 
 	return map[string]any{
 		"url":                target,
+		"method":             method,
+		"scheme":             parsedURL.Scheme,
+		"proto":              "tcp",
+		"http_protocol":      resp.Proto,
 		"status_code":        resp.StatusCode,
 		"http_status":        resp.StatusCode,
+		"response_status":    resp.Status,
 		"latency_ms":         elapsed,
+		"total_ms":           elapsed,
+		"transfer_ms":        transferMs,
 		"body_bytes":         bodyBytes,
 		"timings":            timings,
+		"src_addr":           srcAddr,
+		"dst_addr":           dstAddr,
+		"redirect_count":     redirectCount,
 		"measurement_status": "ok",
 	}, nil
 }

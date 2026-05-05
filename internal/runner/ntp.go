@@ -4,7 +4,10 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"math"
 	"net"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -56,8 +59,12 @@ func (n *NTPRunner) Run(ctx context.Context, target string, options any) (any, e
 	}
 
 	var resp [48]byte
-	if _, err := conn.Read(resp[:]); err != nil {
+	nRead, err := conn.Read(resp[:])
+	if err != nil {
 		return measurementErrorResult(target, host, port, timeoutMs, nil, err), nil
+	}
+	if nRead < len(resp) {
+		return measurementErrorResult(target, host, port, timeoutMs, nil, fmt.Errorf("short ntp response: %d bytes", nRead)), nil
 	}
 	t4 := time.Now().UTC()
 
@@ -67,22 +74,49 @@ func (n *NTPRunner) Run(ctx context.Context, target string, options any) (any, e
 	stratum := int(resp[1])
 	t2 := readNTPTime(resp[32:40])
 	t3 := readNTPTime(resp[40:48])
+	refTime := readNTPTime(resp[16:24])
+	originTime := readNTPTime(resp[24:32])
 	delayMs := ((t4.Sub(t1)).Seconds() - (t3.Sub(t2)).Seconds()) * 1000
 	offsetMs := (((t2.Sub(t1)).Seconds() + (t3.Sub(t4)).Seconds()) / 2) * 1000
 
-	return map[string]any{
+	result := map[string]any{
 		"target":             target,
 		"host":               host,
 		"port":               port,
+		"proto":              "udp",
+		"src_addr":           conn.LocalAddr().String(),
+		"dst_addr":           conn.RemoteAddr().String(),
 		"timeout_ms":         timeoutMs,
 		"offset_ms":          offsetMs,
 		"delay_ms":           delayMs,
+		"root_delay_ms":      ntpFixedPointMs(resp[4:8]),
+		"root_dispersion_ms": ntpFixedPointMs(resp[8:12]),
+		"reference_id":       ntpReferenceID(resp[12:16], stratum),
+		"reference_time":     refTime.Format(time.RFC3339Nano),
+		"origin_time":        originTime.Format(time.RFC3339Nano),
+		"receive_time":       t2.Format(time.RFC3339Nano),
+		"transmit_time":      t3.Format(time.RFC3339Nano),
+		"destination_time":   t4.Format(time.RFC3339Nano),
 		"stratum":            stratum,
 		"leap":               leap,
 		"version":            version,
 		"mode":               mode,
 		"measurement_status": "ok",
-	}, nil
+	}
+	if mode != 4 {
+		result["measurement_status"] = "error"
+		result["error_type"] = "invalid_mode"
+		result["error"] = fmt.Sprintf("unexpected NTP mode %d", mode)
+	} else if stratum == 0 {
+		result["measurement_status"] = "error"
+		result["error_type"] = "kiss_of_death"
+		result["error"] = "server returned stratum 0"
+	} else if math.Abs(originTime.Sub(t1).Seconds()) > 1 {
+		result["measurement_status"] = "error"
+		result["error_type"] = "origin_mismatch"
+		result["error"] = "server origin timestamp does not match request"
+	}
+	return result, nil
 }
 
 func writeNTPTime(dst []byte, t time.Time) {
@@ -100,4 +134,26 @@ func readNTPTime(src []byte) time.Time {
 	unixSecs := int64(secs) - ntpEpochOffset
 	nanos := (int64(frac) * 1e9) >> 32
 	return time.Unix(unixSecs, nanos).UTC()
+}
+
+func ntpFixedPointMs(src []byte) float64 {
+	if len(src) < 4 {
+		return 0
+	}
+	value := binary.BigEndian.Uint32(src[:4])
+	seconds := float64(value>>16) + float64(value&0xffff)/65536
+	return seconds * 1000
+}
+
+func ntpReferenceID(src []byte, stratum int) string {
+	if len(src) < 4 {
+		return ""
+	}
+	if stratum <= 1 {
+		text := strings.TrimSpace(string(src[:4]))
+		if text != "" {
+			return text
+		}
+	}
+	return net.IPv4(src[0], src[1], src[2], src[3]).String() + "/" + strconv.FormatUint(uint64(binary.BigEndian.Uint32(src[:4])), 10)
 }

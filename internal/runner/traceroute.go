@@ -59,7 +59,7 @@ func (t *TracerouteRunner) Run(ctx context.Context, target string, options any) 
 		ip := ""
 		if strings.Contains(body, "*") && !strings.Contains(body, "ms") {
 			for i := 0; i < strings.Count(body, "*"); i++ {
-				probes = append(probes, map[string]any{"result": "timeout"})
+				probes = append(probes, map[string]any{"probe": i + 1, "result": "timeout", "x": "*"})
 			}
 		} else {
 			matches := rttTokenRe.FindAllStringSubmatch(body, -1)
@@ -70,7 +70,7 @@ func (t *TracerouteRunner) Run(ctx context.Context, target string, options any) 
 				if addr != "" && addr != "*" {
 					ip = addr
 				}
-				probe := map[string]any{"result": "reply", "rtt": rtt}
+				probe := map[string]any{"probe": len(probes) + 1, "result": "reply", "rtt": rtt, "rtt_ms": rtt}
 				if addr != "" && addr != "*" {
 					probe["from"] = addr
 				}
@@ -78,13 +78,14 @@ func (t *TracerouteRunner) Run(ctx context.Context, target string, options any) 
 			}
 		}
 		for len(probes) < 3 && strings.Contains(body, "*") {
-			probes = append(probes, map[string]any{"result": "timeout"})
+			probes = append(probes, map[string]any{"probe": len(probes) + 1, "result": "timeout", "x": "*"})
 		}
 
 		hop := map[string]any{
 			"hop":    ttl,
 			"ttl":    ttl,
 			"ip":     ip,
+			"addr":   ip,
 			"result": probes,
 			"rtts":   rtts,
 		}
@@ -94,6 +95,7 @@ func (t *TracerouteRunner) Run(ctx context.Context, target string, options any) 
 	return map[string]any{
 		"target":   target,
 		"max_hops": maxHops,
+		"proto":    "udp",
 		"hops":     hops,
 	}, nil
 }
