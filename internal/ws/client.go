@@ -107,17 +107,19 @@ func (c *Client) connectAndServe(ctx context.Context) error {
 }
 
 func (c *Client) sendAuth(conn *websocket.Conn) error {
-	dn42IPv4, dn42IPv6 := c.detectDN42IPs()
+	dn42IPv4, dn42IPv6 := c.fetchDN42IPs()
 	c.dn42IPv4 = dn42IPv4
 	c.dn42IPv6 = dn42IPv6
-	publicIP := c.detectPublicIP()
+	publicIPv4 := c.fetchPlainIP("https://api-ipv4.ip.sb/ip")
+	publicIPv6 := c.fetchPlainIP("https://api-ipv6.ip.sb/ip")
 
 	payload := map[string]any{
 		"token":                c.cfg.Token,
 		"version":              "1.0.0",
 		"dn42_ipv4":            dn42IPv4,
 		"dn42_ipv6":            dn42IPv6,
-		"public_ip":            publicIP,
+		"public_ip_v4":         publicIPv4,
+		"public_ip_v6":         publicIPv6,
 		"probe_id":             c.store.GetProbeID(),
 		"dn42_ipv4_reachable":  c.dn42IPv4Reachable,
 		"dn42_dns_works":       c.dn42DNSWorks,
@@ -195,66 +197,89 @@ func (c *Client) writeJSON(conn *websocket.Conn, v any) error {
 	return conn.WriteJSON(v)
 }
 
-func (c *Client) detectDN42IPs() (string, string) {
+type myipResponse struct {
+	IP      string `json:"ip"`
+	IsDN42  bool   `json:"is_dn42"`
+	Network string `json:"network"`
+	Country string `json:"country"`
+}
+
+func (c *Client) fetchDN42IPs() (string, string) {
 	var dn42IPv4, dn42IPv6 string
 
-	ifaces, err := net.Interfaces()
-	if err != nil {
-		return "", ""
-	}
-
-	_, dn42Net, _ := net.ParseCIDR("172.20.0.0/14")
-	_, dn42Net10, _ := net.ParseCIDR("10.0.0.0/8")
-	_, dn42Net6, _ := net.ParseCIDR("fd00::/8")
-
-	for _, iface := range ifaces {
-		addrs, err := iface.Addrs()
-		if err != nil {
-			continue
-		}
-		for _, addr := range addrs {
-			var ip net.IP
-			switch v := addr.(type) {
-			case *net.IPNet:
-				ip = v.IP
-			case *net.IPAddr:
-				ip = v.IP
-			}
-			if ip == nil {
-				continue
-			}
-
-			if ip.To4() != nil {
-				if dn42Net.Contains(ip) || dn42Net10.Contains(ip) {
-					if dn42IPv4 == "" || dn42Net.Contains(ip) {
-						dn42IPv4 = ip.String()
-					}
-				}
-			} else {
-				if dn42Net6.Contains(ip) && !ip.IsLinkLocalUnicast() {
-					dn42IPv6 = ip.String()
-				}
-			}
+	if ip, ok := c.fetchMyIP("http://172.23.78.131/myip"); ok {
+		parsed := net.ParseIP(ip)
+		if parsed != nil && parsed.To4() != nil {
+			dn42IPv4 = ip
 		}
 	}
+
+	if ip, ok := c.fetchMyIP("http://[fd0d:81ba:3563::10:4]/myip"); ok {
+		parsed := net.ParseIP(ip)
+		if parsed != nil && parsed.To4() == nil {
+			dn42IPv6 = ip
+		}
+	}
+
+	c.log.WithFields(logrus.Fields{
+		"dn42_ipv4": dn42IPv4,
+		"dn42_ipv6": dn42IPv6,
+	}).Info("fetched DN42 IPs from myip endpoint")
 
 	return dn42IPv4, dn42IPv6
 }
 
-func (c *Client) detectPublicIP() string {
-	client := &http.Client{Timeout: 3 * time.Second}
-	resp, err := client.Get("https://api.ipify.org")
+func (c *Client) fetchMyIP(endpoint string) (string, bool) {
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(endpoint)
 	if err != nil {
-		c.log.WithError(err).Warn("failed to detect public IP")
+		c.log.WithError(err).WithField("endpoint", endpoint).Debug("myip request failed")
+		return "", false
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 512))
+	if err != nil {
+		return "", false
+	}
+
+	var result myipResponse
+	if err := json.Unmarshal(body, &result); err != nil {
+		c.log.WithError(err).WithField("endpoint", endpoint).Debug("myip parse failed")
+		return "", false
+	}
+
+	if !result.IsDN42 || result.IP == "" {
+		return "", false
+	}
+
+	return result.IP, true
+}
+
+func (c *Client) fetchPlainIP(endpoint string) string {
+	client := &http.Client{Timeout: 5 * time.Second}
+	req, err := http.NewRequest("GET", endpoint, nil)
+	if err != nil {
+		return ""
+	}
+	req.Header.Set("User-Agent", "AutoPeer-Atlas-Agent/1.0")
+	resp, err := client.Do(req)
+	if err != nil {
+		c.log.WithError(err).WithField("endpoint", endpoint).Debug("public IP request failed")
 		return ""
 	}
 	defer resp.Body.Close()
 
-	ip, err := io.ReadAll(io.LimitReader(resp.Body, 64))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 64))
 	if err != nil {
 		return ""
 	}
-	return strings.TrimSpace(string(ip))
+
+	ip := strings.TrimSpace(string(body))
+	if net.ParseIP(ip) == nil {
+		return ""
+	}
+	return ip
 }
 
 func (c *Client) exponentialBackoff(ctx context.Context, max time.Duration) {
