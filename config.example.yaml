@@ -1,0 +1,5 @@
+center_url: wss://api.autopeer.su/api/v1/atlas/agent/ws
+token: ap_atl_REPLACE_ME
+store_path: /var/lib/atlas-agent/state.db
+heartbeat_interval: 30s
+reconnect_max_secs: 60
