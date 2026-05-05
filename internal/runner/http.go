@@ -44,8 +44,8 @@ func (h *HTTPRunner) Run(ctx context.Context, target string, options any) (any, 
 	if err != nil || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") || parsedURL.Hostname() == "" {
 		return nil, fmt.Errorf("invalid http target: scheme must be http or https")
 	}
-	if ip := net.ParseIP(parsedURL.Hostname()); ip != nil && isBlockedHTTPIP(ip) {
-		return nil, fmt.Errorf("http target resolves to a blocked address")
+	if !isAllowedHTTPHost(parsedURL.Hostname()) {
+		return nil, fmt.Errorf("http target must be a DN42 IP address or hostname")
 	}
 
 	var bodyBytes int64
@@ -80,6 +80,12 @@ func (h *HTTPRunner) Run(ctx context.Context, target string, options any) (any, 
 		}
 		if !followRedirects {
 			return http.ErrUseLastResponse
+		}
+		if req.URL.Scheme != "http" && req.URL.Scheme != "https" {
+			return fmt.Errorf("http redirect scheme must be http or https")
+		}
+		if !isAllowedHTTPHost(req.URL.Hostname()) {
+			return fmt.Errorf("http redirect target must be a DN42 IP address or hostname")
 		}
 		return nil
 	}
@@ -178,8 +184,8 @@ func (d *safeDialer) DialContext(ctx context.Context, network, address string) (
 		return nil, err
 	}
 	if ip := net.ParseIP(host); ip != nil {
-		if isBlockedHTTPIP(ip) {
-			return nil, fmt.Errorf("http target resolves to a blocked address")
+		if !isAllowedHTTPIP(ip) {
+			return nil, fmt.Errorf("http target resolves outside DN42 address space")
 		}
 		return d.dialer.DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
 	}
@@ -188,30 +194,31 @@ func (d *safeDialer) DialContext(ctx context.Context, network, address string) (
 		return nil, err
 	}
 	for _, addr := range addrs {
-		if isBlockedHTTPIP(addr.IP) {
+		if !isAllowedHTTPIP(addr.IP) {
 			continue
 		}
 		return d.dialer.DialContext(ctx, network, net.JoinHostPort(addr.IP.String(), port))
 	}
-	return nil, fmt.Errorf("http target resolves only to blocked addresses")
+	return nil, fmt.Errorf("http target resolves outside DN42 address space")
 }
 
-func isBlockedHTTPIP(ip net.IP) bool {
+func isAllowedHTTPHost(host string) bool {
+	host = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
+	if ip := net.ParseIP(host); ip != nil {
+		return isAllowedHTTPIP(ip)
+	}
+	return host == "dn42" || strings.HasSuffix(host, ".dn42") || strings.HasSuffix(host, ".internal")
+}
+
+func isAllowedHTTPIP(ip net.IP) bool {
 	if ip.IsLoopback() || ip.IsUnspecified() || ip.IsMulticast() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
-		return true
+		return false
 	}
 	if ip4 := ip.To4(); ip4 != nil {
-		if ip4[0] == 169 && ip4[1] == 254 {
-			return true
-		}
-		if ip4[0] == 10 || (ip4[0] == 192 && ip4[1] == 168) {
-			return true
-		}
-		if ip4[0] == 172 && ip4[1] >= 16 && ip4[1] <= 31 {
-			return !(ip4[1] >= 20 && ip4[1] <= 23)
-		}
+		return ip4[0] == 172 && ip4[1] >= 20 && ip4[1] <= 23
 	}
-	return false
+	ip16 := ip.To16()
+	return ip16 != nil && ip16[0]&0xfe == 0xfc
 }
 
 func millisSince(start time.Time) float64 {
