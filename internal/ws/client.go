@@ -21,19 +21,26 @@ type MessageHandler interface {
 }
 
 type Store interface {
-	GetProbeID() string
+	GetProbeID() (string, error)
 	SetProbeID(id string) error
+}
+
+type StatusProvider interface {
+	Status() map[string]any
 }
 
 type Client struct {
 	cfg     *config.Config
 	store   Store
 	handler MessageHandler
+	status  StatusProvider
 	log     *logrus.Logger
 
-	conn   *websocket.Conn
-	connMu sync.Mutex
-	sendCh chan map[string]any
+	conn                 *websocket.Conn
+	connMu               sync.Mutex
+	sendCh               chan map[string]any
+	declaredCapabilities []string
+	capabilityVersions   map[string]string
 
 	dn42IPv4Reachable bool
 	dn42DNSWorks      bool
@@ -49,6 +56,22 @@ func NewClient(cfg *config.Config, s Store, h MessageHandler, log *logrus.Logger
 		handler: h,
 		log:     log,
 		sendCh:  make(chan map[string]any, 256),
+	}
+}
+
+func (c *Client) SetStatusProvider(status StatusProvider) {
+	c.status = status
+}
+
+func (c *Client) SetCapabilities(capabilities []string, versions map[string]string) {
+	if len(capabilities) > 0 {
+		c.declaredCapabilities = append([]string(nil), capabilities...)
+	}
+	if len(versions) > 0 {
+		c.capabilityVersions = make(map[string]string, len(versions))
+		for k, v := range versions {
+			c.capabilityVersions[k] = v
+		}
 	}
 }
 
@@ -90,17 +113,21 @@ func (c *Client) connectAndServe(ctx context.Context) error {
 		return fmt.Errorf("auth send failed: %w", err)
 	}
 
+	connCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	errCh := make(chan error, 3)
 
 	go c.readPump(conn, errCh)
-	go c.writePump(conn, errCh)
-	go c.heartbeatLoop(ctx, conn, errCh)
+	go c.writePump(connCtx, conn, errCh)
+	go c.heartbeatLoop(connCtx, conn, errCh)
 
 	select {
 	case err := <-errCh:
+		cancel()
 		conn.Close()
 		return err
 	case <-ctx.Done():
+		cancel()
 		conn.Close()
 		return ctx.Err()
 	}
@@ -113,17 +140,29 @@ func (c *Client) sendAuth(conn *websocket.Conn) error {
 	publicIPv4 := c.fetchPlainIP("https://api-ipv4.ip.sb/ip")
 	publicIPv6 := c.fetchPlainIP("https://api-ipv6.ip.sb/ip")
 
+	probeID, err := c.store.GetProbeID()
+	if err != nil {
+		c.log.WithError(err).Warn("failed to load stored probe_id")
+	}
+
 	payload := map[string]any{
-		"token":                c.cfg.Token,
-		"version":              "1.0.0",
-		"dn42_ipv4":            dn42IPv4,
-		"dn42_ipv6":            dn42IPv6,
-		"public_ip_v4":         publicIPv4,
-		"public_ip_v6":         publicIPv6,
-		"probe_id":             c.store.GetProbeID(),
-		"dn42_ipv4_reachable":  c.dn42IPv4Reachable,
-		"dn42_dns_works":       c.dn42DNSWorks,
-		"system_dns_works":     c.systemDNSWorks,
+		"token":               c.cfg.Token,
+		"version":             "1.0.0",
+		"dn42_ipv4":           dn42IPv4,
+		"dn42_ipv6":           dn42IPv6,
+		"public_ip_v4":        publicIPv4,
+		"public_ip_v6":        publicIPv6,
+		"probe_id":            probeID,
+		"dn42_ipv4_reachable": c.dn42IPv4Reachable,
+		"dn42_dns_works":      c.dn42DNSWorks,
+		"system_dns_works":    c.systemDNSWorks,
+		"capabilities":        c.capabilities(),
+		"capability_versions": c.capabilityVersionsCopy(),
+	}
+	if c.status != nil {
+		for k, v := range c.status.Status() {
+			payload[k] = v
+		}
 	}
 
 	msg := map[string]any{
@@ -152,10 +191,15 @@ func (c *Client) readPump(conn *websocket.Conn, errCh chan<- error) {
 	}
 }
 
-func (c *Client) writePump(conn *websocket.Conn, errCh chan<- error) {
-	for msg := range c.sendCh {
-		if err := c.writeJSON(conn, msg); err != nil {
-			errCh <- fmt.Errorf("write: %w", err)
+func (c *Client) writePump(ctx context.Context, conn *websocket.Conn, errCh chan<- error) {
+	for {
+		select {
+		case msg := <-c.sendCh:
+			if err := c.writeJSON(conn, msg); err != nil {
+				errCh <- fmt.Errorf("write: %w", err)
+				return
+			}
+		case <-ctx.Done():
 			return
 		}
 	}
@@ -168,14 +212,26 @@ func (c *Client) heartbeatLoop(ctx context.Context, conn *websocket.Conn, errCh 
 	for {
 		select {
 		case <-ticker.C:
+			probeID, err := c.store.GetProbeID()
+			if err != nil {
+				c.log.WithError(err).Warn("failed to load stored probe_id")
+			}
+			payload := map[string]any{
+				"probe_id":            probeID,
+				"version":             "1.0.0",
+				"dn42_ipv4":           c.dn42IPv4,
+				"dn42_ipv6":           c.dn42IPv6,
+				"capabilities":        c.capabilities(),
+				"capability_versions": c.capabilityVersionsCopy(),
+			}
+			if c.status != nil {
+				for k, v := range c.status.Status() {
+					payload[k] = v
+				}
+			}
 			msg := map[string]any{
-				"type": "atlas.heartbeat",
-				"payload": map[string]any{
-					"probe_id":  c.store.GetProbeID(),
-					"version":   "1.0.0",
-					"dn42_ipv4": c.dn42IPv4,
-					"dn42_ipv6": c.dn42IPv6,
-				},
+				"type":    "atlas.heartbeat",
+				"payload": payload,
 			}
 			if err := c.writeJSON(conn, msg); err != nil {
 				errCh <- fmt.Errorf("heartbeat: %w", err)
@@ -188,13 +244,46 @@ func (c *Client) heartbeatLoop(ctx context.Context, conn *websocket.Conn, errCh 
 }
 
 func (c *Client) Send(msg map[string]any) {
-	c.sendCh <- msg
+	select {
+	case c.sendCh <- msg:
+	default:
+		c.log.WithField("type", msg["type"]).Warn("send queue full, dropping message")
+	}
 }
 
 func (c *Client) writeJSON(conn *websocket.Conn, v any) error {
 	c.connMu.Lock()
 	defer c.connMu.Unlock()
+	if err := conn.SetWriteDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		return err
+	}
 	return conn.WriteJSON(v)
+}
+
+func (c *Client) Close() {
+	c.connMu.Lock()
+	defer c.connMu.Unlock()
+	if c.conn != nil {
+		_ = c.conn.Close()
+	}
+}
+
+func (c *Client) capabilities() []string {
+	if len(c.declaredCapabilities) == 0 {
+		return []string{"ping", "traceroute", "dns", "http", "tls", "ntp"}
+	}
+	return append([]string(nil), c.declaredCapabilities...)
+}
+
+func (c *Client) capabilityVersionsCopy() map[string]string {
+	if len(c.capabilityVersions) == 0 {
+		return map[string]string{}
+	}
+	copyMap := make(map[string]string, len(c.capabilityVersions))
+	for k, v := range c.capabilityVersions {
+		copyMap[k] = v
+	}
+	return copyMap
 }
 
 type myipResponse struct {
