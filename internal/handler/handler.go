@@ -19,25 +19,31 @@ import (
 type SendFunc func(msg map[string]any)
 
 type Handler struct {
-	runners        map[string]runner.Runner
-	store          *store.Store
-	send           SendFunc
-	log            *logrus.Logger
-	jobs           chan map[string]any
-	authFailed     func()
-	runningJobs    int64
-	droppedJobs    int64
-	systemPlatform string
-	systemOS       string
-	systemArch     string
-	clockStatus    string
-	lastError      string
-	mu             sync.Mutex
+	runners         map[string]runner.Runner
+	store           *store.Store
+	send            SendFunc
+	log             *logrus.Logger
+	jobs            chan map[string]any
+	authFailed      func()
+	runningJobs     int64
+	droppedJobs     int64
+	systemPlatform  string
+	systemOS        string
+	systemArch      string
+	clockStatus     string
+	lastError       string
+	maxConcurrency  int64
+	queueSize       int64
+	jobTimeoutNanos int64
+	workerNotify    chan struct{}
+	mu              sync.Mutex
 }
 
 const (
 	defaultConcurrency = 8
+	maxConcurrency     = 64
 	defaultQueueSize   = 64
+	maxQueueSize       = 1024
 	defaultJobTimeout  = 30 * time.Second
 	resultMver         = "autopeer-atlas-agent-1"
 )
@@ -55,17 +61,21 @@ type atlasJobMeta struct {
 
 func New(runners map[string]runner.Runner, s *store.Store, send SendFunc, log *logrus.Logger) *Handler {
 	h := &Handler{
-		runners:        runners,
-		store:          s,
-		send:           send,
-		log:            log,
-		jobs:           make(chan map[string]any, defaultQueueSize),
-		systemPlatform: runtime.GOOS + "/" + runtime.GOARCH,
-		systemOS:       runtime.GOOS,
-		systemArch:     runtime.GOARCH,
-		clockStatus:    "unknown",
+		runners:         runners,
+		store:           s,
+		send:            send,
+		log:             log,
+		jobs:            make(chan map[string]any, maxQueueSize),
+		systemPlatform:  runtime.GOOS + "/" + runtime.GOARCH,
+		systemOS:        runtime.GOOS,
+		systemArch:      runtime.GOARCH,
+		clockStatus:     "unknown",
+		maxConcurrency:  defaultConcurrency,
+		queueSize:       defaultQueueSize,
+		jobTimeoutNanos: int64(defaultJobTimeout),
+		workerNotify:    make(chan struct{}, 1),
 	}
-	for i := 0; i < defaultConcurrency; i++ {
+	for i := 0; i < maxConcurrency; i++ {
 		go h.worker()
 	}
 	return h
@@ -90,16 +100,18 @@ func (h *Handler) Status() map[string]any {
 	defer h.mu.Unlock()
 
 	return map[string]any{
-		"queue_depth":  len(h.jobs),
-		"queue_size":   cap(h.jobs),
-		"running_jobs": atomic.LoadInt64(&h.runningJobs),
-		"dropped_jobs": atomic.LoadInt64(&h.droppedJobs),
-		"concurrency":  defaultConcurrency,
-		"platform":     h.systemPlatform,
-		"os":           h.systemOS,
-		"arch":         h.systemArch,
-		"clock_status": h.clockStatus,
-		"last_error":   h.lastError,
+		"queue_depth":         len(h.jobs),
+		"queue_size":          atomic.LoadInt64(&h.queueSize),
+		"queue_capacity":      cap(h.jobs),
+		"running_jobs":        atomic.LoadInt64(&h.runningJobs),
+		"dropped_jobs":        atomic.LoadInt64(&h.droppedJobs),
+		"concurrency":         atomic.LoadInt64(&h.maxConcurrency),
+		"job_timeout_seconds": int64(time.Duration(atomic.LoadInt64(&h.jobTimeoutNanos)) / time.Second),
+		"platform":            h.systemPlatform,
+		"os":                  h.systemOS,
+		"arch":                h.systemArch,
+		"clock_status":        h.clockStatus,
+		"last_error":          h.lastError,
 	}
 }
 
@@ -110,6 +122,13 @@ func (h *Handler) HandleMessage(msg map[string]any) {
 	case "atlas.auth_ack":
 		h.handleAuthAck(msg)
 	case "atlas.job":
+		if int64(len(h.jobs)) >= atomic.LoadInt64(&h.queueSize) {
+			atomic.AddInt64(&h.droppedJobs, 1)
+			meta, _ := atlasJobMetaFromMessage(msg)
+			now := time.Now()
+			h.sendResult(meta, nil, fmt.Errorf("job queue full"), now, now)
+			return
+		}
 		select {
 		case h.jobs <- msg:
 		default:
@@ -125,9 +144,23 @@ func (h *Handler) HandleMessage(msg map[string]any) {
 
 func (h *Handler) worker() {
 	for msg := range h.jobs {
+		for atomic.LoadInt64(&h.runningJobs) >= atomic.LoadInt64(&h.maxConcurrency) {
+			select {
+			case <-h.workerNotify:
+			case <-time.After(100 * time.Millisecond):
+			}
+		}
 		atomic.AddInt64(&h.runningJobs, 1)
 		h.handleJob(msg)
 		atomic.AddInt64(&h.runningJobs, -1)
+		h.notifyWorkers()
+	}
+}
+
+func (h *Handler) notifyWorkers() {
+	select {
+	case h.workerNotify <- struct{}{}:
+	default:
 	}
 }
 
@@ -158,7 +191,31 @@ func (h *Handler) handleAuthAck(msg map[string]any) {
 		h.log.WithError(err).Error("failed to store probe_id")
 		return
 	}
+	h.applyPolicy(payload["policy"])
 	h.log.WithField("probe_id", probeID).Info("authenticated")
+}
+
+func (h *Handler) applyPolicy(raw any) {
+	policy, _ := raw.(map[string]any)
+	if len(policy) == 0 {
+		return
+	}
+	if n, err := runner.ToInt(policy["max_concurrency"]); err == nil && n > 0 {
+		if n > maxConcurrency {
+			n = maxConcurrency
+		}
+		atomic.StoreInt64(&h.maxConcurrency, int64(n))
+	}
+	if n, err := runner.ToInt(policy["queue_size"]); err == nil && n > 0 {
+		if n > maxQueueSize {
+			n = maxQueueSize
+		}
+		atomic.StoreInt64(&h.queueSize, int64(n))
+	}
+	if n, err := runner.ToInt(policy["job_timeout_seconds"]); err == nil && n > 0 {
+		atomic.StoreInt64(&h.jobTimeoutNanos, int64(time.Duration(n)*time.Second))
+	}
+	h.notifyWorkers()
 }
 
 func (h *Handler) handleJob(msg map[string]any) {
@@ -416,7 +473,7 @@ func (h *Handler) jobTimeout(jobType string, msg, payload map[string]any, option
 			}
 		}
 	}
-	return defaultJobTimeout
+	return time.Duration(atomic.LoadInt64(&h.jobTimeoutNanos))
 }
 
 func agentStatus(err error) string {
