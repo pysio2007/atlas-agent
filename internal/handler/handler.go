@@ -263,6 +263,9 @@ func atlasJobMetaFromMessage(msg map[string]any) (atlasJobMeta, map[string]any) 
 		meta.ProbeID = v
 	}
 	meta.Type, _ = payload["type"].(string)
+	if meta.Type == "sslcert" {
+		meta.Type = "tls"
+	}
 	meta.Target, _ = payload["target"].(string)
 	meta.AF, _ = payload["af"].(string)
 	meta.Proto, _ = payload["proto"].(string)

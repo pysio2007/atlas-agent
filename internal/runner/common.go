@@ -30,6 +30,8 @@ func DetectCapabilities(ctx context.Context) CapabilityReport {
 		report.Capabilities = append(report.Capabilities, "traceroute")
 		report.Versions["traceroute"] = version
 	}
+	report.Capabilities = append(report.Capabilities, "sslcert")
+	report.Versions["sslcert"] = "tls-runner"
 
 	return report
 }
