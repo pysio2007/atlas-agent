@@ -49,7 +49,8 @@ func (p *PingRunner) Run(ctx context.Context, target string, options any) (any, 
 	}
 
 	timeoutSeconds := (timeoutMs + 999) / 1000
-	cmd := exec.CommandContext(ctx, "ping", "-c", strconv.Itoa(count), "-W", strconv.Itoa(timeoutSeconds), target)
+	targetArg := resolveCommandTarget(ctx, target)
+	cmd := exec.CommandContext(ctx, "ping", "-c", strconv.Itoa(count), "-W", strconv.Itoa(timeoutSeconds), targetArg)
 	out, err := cmd.CombinedOutput()
 	if err != nil && len(out) == 0 {
 		return nil, fmt.Errorf("ping execution failed: %w", err)
@@ -61,6 +62,9 @@ func (p *PingRunner) Run(ctx context.Context, target string, options any) (any, 
 		"count":      count,
 		"timeout":    timeoutSeconds,
 		"timeout_ms": timeoutMs,
+	}
+	if targetArg != target {
+		result["resolved_target"] = targetArg
 	}
 
 	if sm := statsLineRe.FindStringSubmatch(output); len(sm) == 4 {

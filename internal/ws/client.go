@@ -270,9 +270,15 @@ func (c *Client) Close() {
 
 func (c *Client) capabilities() []string {
 	if len(c.declaredCapabilities) == 0 {
-		return []string{"ping", "traceroute", "dns", "http", "tls", "ntp"}
+		return []string{"ping", "traceroute", "dns", "http", "tls", "sslcert", "ntp"}
 	}
-	return append([]string(nil), c.declaredCapabilities...)
+	capabilities := append([]string(nil), c.declaredCapabilities...)
+	for _, capability := range capabilities {
+		if capability == "tls" {
+			return append(capabilities, "sslcert")
+		}
+	}
+	return capabilities
 }
 
 func (c *Client) capabilityVersionsCopy() map[string]string {

@@ -15,6 +15,7 @@ var rttTokenRe = regexp.MustCompile(`(?:(\S+)\s+)?([\d.]+)\s+ms`)
 
 func (t *TracerouteRunner) Run(ctx context.Context, target string, options any) (any, error) {
 	maxHops := 30
+	proto := "udp"
 	if err := validateCommandTarget(target); err != nil {
 		return nil, err
 	}
@@ -25,12 +26,30 @@ func (t *TracerouteRunner) Run(ctx context.Context, target string, options any) 
 				maxHops = n
 			}
 		}
+		if v, ok := m["proto"].(string); ok && v != "" {
+			proto = strings.ToLower(v)
+		}
+		if v, ok := m["protocol"].(string); ok && v != "" {
+			proto = strings.ToLower(v)
+		}
 	}
 	if maxHops < 1 || maxHops > 64 {
 		return nil, fmt.Errorf("invalid traceroute max_hops %d: must be 1-64", maxHops)
 	}
+	if proto != "udp" && proto != "icmp" && proto != "tcp" {
+		return nil, fmt.Errorf("invalid traceroute proto %s: must be udp, icmp, or tcp", proto)
+	}
 
-	cmd := exec.CommandContext(ctx, "traceroute", "-m", strconv.Itoa(maxHops), "-w", "3", "-q", "3", target)
+	args := []string{"-m", strconv.Itoa(maxHops), "-w", "3", "-q", "3"}
+	switch proto {
+	case "icmp":
+		args = append(args, "-I")
+	case "tcp":
+		args = append(args, "-T")
+	}
+	targetArg := resolveCommandTarget(ctx, target)
+	args = append(args, targetArg)
+	cmd := exec.CommandContext(ctx, "traceroute", args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil && len(out) == 0 {
 		return nil, fmt.Errorf("traceroute execution failed: %w", err)
@@ -92,10 +111,14 @@ func (t *TracerouteRunner) Run(ctx context.Context, target string, options any) 
 		hops = append(hops, hop)
 	}
 
-	return map[string]any{
+	result := map[string]any{
 		"target":   target,
 		"max_hops": maxHops,
-		"proto":    "udp",
+		"proto":    proto,
 		"hops":     hops,
-	}, nil
+	}
+	if targetArg != target {
+		result["resolved_target"] = targetArg
+	}
+	return result, nil
 }

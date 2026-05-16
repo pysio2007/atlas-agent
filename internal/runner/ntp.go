@@ -34,14 +34,16 @@ func (n *NTPRunner) Run(ctx context.Context, target string, options any) (any, e
 	ctx, cancel := context.WithTimeout(ctx, time.Duration(timeoutMs)*time.Millisecond)
 	defer cancel()
 
-	addr := net.JoinHostPort(host, port)
-	udpAddr, err := net.ResolveUDPAddr("udp", addr)
+	addrs, err := lookupIPAddrWithDN42Fallback(ctx, host)
 	if err != nil {
 		return measurementErrorResult(target, host, port, timeoutMs, nil, err), nil
 	}
+	if len(addrs) == 0 {
+		return measurementErrorResult(target, host, port, timeoutMs, nil, fmt.Errorf("no ip addresses found for %s", host)), nil
+	}
 
 	dialer := net.Dialer{}
-	conn, err := dialer.DialContext(ctx, "udp", udpAddr.String())
+	conn, err := dialer.DialContext(ctx, "udp", net.JoinHostPort(addrs[0].IP.String(), port))
 	if err != nil {
 		return measurementErrorResult(target, host, port, timeoutMs, nil, err), nil
 	}

@@ -50,7 +50,7 @@ func (t *TLSRunner) Run(ctx context.Context, target string, options any) (any, e
 		serverName = ""
 	} else {
 		dnsStart := time.Now()
-		addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+		addrs, err := lookupIPAddrWithDN42Fallback(ctx, host)
 		if err != nil {
 			return measurementErrorResult(target, host, port, timeoutMs, timings, err), nil
 		}
