@@ -47,7 +47,8 @@ func (t *TracerouteRunner) Run(ctx context.Context, target string, options any) 
 	case "tcp":
 		args = append(args, "-T")
 	}
-	args = append(args, target)
+	targetArg := resolveCommandTarget(ctx, target)
+	args = append(args, targetArg)
 	cmd := exec.CommandContext(ctx, "traceroute", args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil && len(out) == 0 {
@@ -110,10 +111,14 @@ func (t *TracerouteRunner) Run(ctx context.Context, target string, options any) 
 		hops = append(hops, hop)
 	}
 
-	return map[string]any{
+	result := map[string]any{
 		"target":   target,
 		"max_hops": maxHops,
 		"proto":    proto,
 		"hops":     hops,
-	}, nil
+	}
+	if targetArg != target {
+		result["resolved_target"] = targetArg
+	}
+	return result, nil
 }

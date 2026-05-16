@@ -44,10 +44,6 @@ func (h *HTTPRunner) Run(ctx context.Context, target string, options any) (any, 
 	if err != nil || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") || parsedURL.Hostname() == "" {
 		return nil, fmt.Errorf("invalid http target: scheme must be http or https")
 	}
-	if !isAllowedHTTPHost(parsedURL.Hostname()) {
-		return nil, fmt.Errorf("http target must be a DN42 IP address or hostname")
-	}
-
 	var bodyBytes int64
 	timings := map[string]float64{}
 	var srcAddr, dstAddr string
@@ -83,9 +79,6 @@ func (h *HTTPRunner) Run(ctx context.Context, target string, options any) (any, 
 		}
 		if req.URL.Scheme != "http" && req.URL.Scheme != "https" {
 			return fmt.Errorf("http redirect scheme must be http or https")
-		}
-		if !isAllowedHTTPHost(req.URL.Hostname()) {
-			return fmt.Errorf("http redirect target must be a DN42 IP address or hostname")
 		}
 		return nil
 	}
@@ -184,41 +177,16 @@ func (d *safeDialer) DialContext(ctx context.Context, network, address string) (
 		return nil, err
 	}
 	if ip := net.ParseIP(host); ip != nil {
-		if !isAllowedHTTPIP(ip) {
-			return nil, fmt.Errorf("http target resolves outside DN42 address space")
-		}
 		return d.dialer.DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
 	}
-	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	addrs, err := lookupIPAddrWithDN42Fallback(ctx, host)
 	if err != nil {
 		return nil, err
 	}
 	for _, addr := range addrs {
-		if !isAllowedHTTPIP(addr.IP) {
-			continue
-		}
 		return d.dialer.DialContext(ctx, network, net.JoinHostPort(addr.IP.String(), port))
 	}
-	return nil, fmt.Errorf("http target resolves outside DN42 address space")
-}
-
-func isAllowedHTTPHost(host string) bool {
-	host = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
-	if ip := net.ParseIP(host); ip != nil {
-		return isAllowedHTTPIP(ip)
-	}
-	return host == "dn42" || strings.HasSuffix(host, ".dn42") || strings.HasSuffix(host, ".internal")
-}
-
-func isAllowedHTTPIP(ip net.IP) bool {
-	if ip.IsLoopback() || ip.IsUnspecified() || ip.IsMulticast() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
-		return false
-	}
-	if ip4 := ip.To4(); ip4 != nil {
-		return ip4[0] == 172 && ip4[1] >= 20 && ip4[1] <= 23
-	}
-	ip16 := ip.To16()
-	return ip16 != nil && ip16[0]&0xfe == 0xfc
+	return nil, fmt.Errorf("http target has no resolved addresses")
 }
 
 func millisSince(start time.Time) float64 {
